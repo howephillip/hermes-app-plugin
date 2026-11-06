@@ -46,7 +46,7 @@ logger = logging.getLogger(__name__)
 
 PLATFORM = "hermes_app"
 PLUGIN_NAME = "hermes-app"
-PLUGIN_VERSION = "1.3.0"  # keep in step with plugin.yaml; the app compares it to know when to offer an update
+PLUGIN_VERSION = "1.3.1"  # keep in step with plugin.yaml; the app compares it to know when to offer an update
 DEFAULT_PORT = 8648
 PROTOCOL = 1
 # What this plugin can do, announced to the app on connect so a newer app can tell what an older plugin lacks.
@@ -875,6 +875,21 @@ async def _standalone_send(pconfig, chat_id: str, message: str, *, thread_id: Op
         return {"error": f"Hermes App log not writable: {exc}"}
 
 
+# What the agent is told about this surface (part of its system prompt, so Hermes caches it: it costs almost nothing
+# per message). The fenced-code rule matters most for voice: Hermes leaves fenced blocks out of a spoken reply but
+# speaks a command written inline or on a bare line.
+PLATFORM_HINT = (
+    "You are chatting with the user through their own Hermes mobile app on their phone. "
+    "Markdown is supported. You may send follow-up messages later (for example when a long task "
+    "finishes or a scheduled job runs); they arrive on the phone right away. Deliver files by writing "
+    "MEDIA:/absolute/path/to/file on its own line: images, audio, video and documents (up to 25 MB) arrive as "
+    "attachments in the chat. Remote images render via ![alt](url). "
+    "Always put terminal commands and code in a fenced code block (three backticks on their own lines), never inline "
+    "in a sentence and never on a bare line: the app shows a copyable block, and replies read aloud skip fenced "
+    "blocks. Introduce it in words (\"run this:\") and keep the sentence around it free of the command itself."
+)
+
+
 def register(ctx):
     entry = dict(
         name=PLATFORM,
@@ -894,12 +909,7 @@ def register(ctx):
         # The app shows tool activity itself (from the hook below), so Hermes's text progress lines are off by
         # default for this platform. A user's own display settings still win.
         display_overrides={"tool_progress": "off", "show_reasoning": False},
-        platform_hint=(
-            "You are chatting with the user through their own Hermes mobile app on their phone. "
-            "Markdown is supported. You may send follow-up messages later (for example when a long task "
-            "finishes or a scheduled job runs); they arrive on the phone right away. Deliver files by writing "
-            "MEDIA:/absolute/path/to/file on its own line: images, audio, video and documents (up to 25 MB) arrive as "
-            "attachments in the chat. Remote images render via ![alt](url)."))
+        platform_hint=PLATFORM_HINT)
     try:
         ctx.register_platform(**entry)
     except TypeError:  # an older Hermes that doesn't know a newer option: register without the extras
