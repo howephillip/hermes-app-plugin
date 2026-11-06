@@ -22,7 +22,11 @@ import json
 import logging
 import os
 import pathlib
+import shlex
+import shutil
 import struct
+import subprocess
+import sys
 import time
 import uuid
 from collections import OrderedDict
@@ -37,6 +41,8 @@ from gateway.platforms.event import MessageEvent, MessageType
 logger = logging.getLogger(__name__)
 
 PLATFORM = "hermes_app"
+PLUGIN_NAME = "hermes-app"
+PLUGIN_VERSION = "1.1.0"  # keep in step with plugin.yaml; the app compares it to know when to offer an update
 DEFAULT_PORT = 8648
 PROTOCOL = 1
 LOG_KEEP = 5000  # entries kept in the log across restarts
@@ -189,6 +195,7 @@ class HermesAppAdapter(BasePlatformAdapter):
         self._pump_task: Optional[asyncio.Task] = None
         self._wake: Optional[asyncio.Event] = None  # set when this process appends, so delivery needn't wait for a poll
         self._offset = 0
+        self._updating = False
         self._seen: "OrderedDict[str, None]" = OrderedDict()  # inbound ids already handled (client retries)
 
     @property
@@ -358,7 +365,7 @@ class HermesAppAdapter(BasePlatformAdapter):
                 k, _, v = line.partition(":")
                 headers[k.strip().lower()] = v.strip()
         if len(request) >= 2 and request[1].startswith("/health"):
-            body = json.dumps({"service": "hermes-app", "protocol": PROTOCOL}).encode()
+            body = json.dumps({"service": "hermes-app", "protocol": PROTOCOL, "version": PLUGIN_VERSION}).encode()
             writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n"
                          + f"Content-Length: {len(body)}\r\n\r\n".encode() + body)
             await writer.drain()
@@ -383,7 +390,8 @@ class HermesAppAdapter(BasePlatformAdapter):
         client.device = str(msg.get("device") or "")[:64]
         after = msg.get("after")
         latest = _latest_seq()
-        await client.send_json({"t": "ready", "protocol": PROTOCOL, "latest": latest, "home": self._home_chat()})
+        await client.send_json({"t": "ready", "protocol": PROTOCOL, "version": PLUGIN_VERSION,
+                                "latest": latest, "home": self._home_chat()})
         if isinstance(after, int) and after < latest:
             for entry in _read_log(after):
                 await client.send_json(entry)
@@ -399,6 +407,37 @@ class HermesAppAdapter(BasePlatformAdapter):
             await client.send_json({"t": "pong"})
         elif kind == "msg":
             await self._inbound(client, msg)
+        elif kind == "update":
+            await self._update_plugin(client)
+        elif kind == "restart":
+            await client.send_json({"t": "restarting"})
+            _restart_gateway_soon()
+
+    async def _update_plugin(self, client: _Client) -> None:
+        """Fixed action, only for an authenticated app: pull the newest plugin with Hermes's own command, then
+        restart so the new code loads. Nothing the app sends is ever run as a command."""
+        if self._updating:
+            return
+        self._updating = True
+        try:
+            before = _installed_version()
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    *_hermes_cmd(), "plugins", "update", PLUGIN_NAME,
+                    stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
+                out, _ = await asyncio.wait_for(proc.communicate(), timeout=120)
+                ok = proc.returncode == 0
+                detail = out.decode(errors="replace").strip()[-300:]
+            except Exception as exc:  # noqa: BLE001 - reported to the app as text
+                ok, detail = False, f"{type(exc).__name__}: {exc}"
+            after = _installed_version()
+            changed = ok and after and after != PLUGIN_VERSION
+            await client.send_json({"t": "update_result", "ok": ok, "changed": bool(changed),
+                                    "version": after or before, "detail": detail})
+            if changed:
+                _restart_gateway_soon()
+        finally:
+            self._updating = False
 
     async def _inbound(self, client: _Client, msg: dict) -> None:
         mid = str(msg.get("id") or uuid.uuid4().hex)
@@ -443,6 +482,30 @@ class HermesAppAdapter(BasePlatformAdapter):
 
 
 # ── plugin registration ──────────────────────────────────────────────────────
+
+def _hermes_cmd() -> list:
+    """How to run the `hermes` command from inside the gateway, which may not have it on its PATH."""
+    exe = shutil.which("hermes")
+    return [exe] if exe else [sys.executable, "-m", "hermes_cli.main"]
+
+
+def _installed_version() -> str:
+    """Version in the plugin.yaml on disk (what is installed now), which differs from the running code after an update."""
+    try:
+        for line in (pathlib.Path(__file__).parent / "plugin.yaml").read_text().splitlines():
+            if line.startswith("version:"):
+                return line.split(":", 1)[1].strip().strip("\"'")
+    except OSError:
+        pass
+    return ""
+
+
+def _restart_gateway_soon(delay: int = 3) -> None:
+    """Restart the gateway a moment from now, from a detached process (this one is about to be replaced)."""
+    cmd = " ".join(shlex.quote(a) for a in _hermes_cmd() + ["gateway", "restart", "-y", "--detach"])
+    subprocess.Popen(["sh", "-c", f"sleep {int(delay)}; {cmd}"], start_new_session=True,
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
 
 def _port(value) -> int:
     try:
