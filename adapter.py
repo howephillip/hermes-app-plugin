@@ -43,7 +43,7 @@ logger = logging.getLogger(__name__)
 
 PLATFORM = "hermes_app"
 PLUGIN_NAME = "hermes-app"
-PLUGIN_VERSION = "1.2.0"  # keep in step with plugin.yaml; the app compares it to know when to offer an update
+PLUGIN_VERSION = "1.2.1"  # keep in step with plugin.yaml; the app compares it to know when to offer an update
 DEFAULT_PORT = 8648
 PROTOCOL = 1
 # What this plugin can do, announced to the app on connect so a newer app can tell what an older plugin lacks.
@@ -314,6 +314,14 @@ class HermesAppAdapter(BasePlatformAdapter):
         mid = uuid.uuid4().hex
         self._remember_kind(mid, kind, metadata)
         entry = self._record({"t": "msg", "id": mid, "chat": str(chat_id), "text": content, "kind": kind})
+        return SendResult(success=True, message_id=entry["id"])
+
+    async def send_or_update_status(self, chat_id: str, status_key: str, content: str, metadata=None):
+        """Hermes routes the agent's own status lines here (memory recall, compaction, lifecycle notices): by
+        definition not a reply, so they are labelled status and never spoken. Each one is its own line."""
+        mid = uuid.uuid4().hex
+        self._kinds[mid] = "status:explicit"
+        entry = self._record({"t": "msg", "id": mid, "chat": str(chat_id), "text": content, "kind": "status"})
         return SendResult(success=True, message_id=entry["id"])
 
     async def edit_message(self, chat_id: str, message_id: str, content: str, *, finalize: bool = False):

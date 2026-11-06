@@ -1,7 +1,7 @@
 name: hermes-app
 label: Hermes App
 kind: platform
-version: 1.2.0
+version: 1.2.1
 description: >
   Live connection for the Hermes mobile app. Adds the app as a messaging
   platform, like Telegram or WhatsApp: one persistent WebSocket carries
