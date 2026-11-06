@@ -20,8 +20,10 @@ import hashlib
 import hmac
 import json
 import logging
+import mimetypes
 import os
 import pathlib
+import re
 import shlex
 import shutil
 import struct
@@ -29,6 +31,7 @@ import subprocess
 import sys
 import time
 import unicodedata
+import urllib.parse
 import uuid
 from collections import OrderedDict
 from typing import Any, Dict, Optional
@@ -43,11 +46,11 @@ logger = logging.getLogger(__name__)
 
 PLATFORM = "hermes_app"
 PLUGIN_NAME = "hermes-app"
-PLUGIN_VERSION = "1.2.1"  # keep in step with plugin.yaml; the app compares it to know when to offer an update
+PLUGIN_VERSION = "1.3.0"  # keep in step with plugin.yaml; the app compares it to know when to offer an update
 DEFAULT_PORT = 8648
 PROTOCOL = 1
 # What this plugin can do, announced to the app on connect so a newer app can tell what an older plugin lacks.
-FEATURES = ["kinds", "activity", "update"]
+FEATURES = ["kinds", "activity", "update", "files"]
 LOG_KEEP = 5000  # entries kept in the log across restarts
 MAX_FRAME = 24 * 1024 * 1024  # a photo or two, base64 encoded
 MAX_REPLAY = 500
@@ -121,6 +124,123 @@ def _latest_seq() -> int:
     return entries[-1]["seq"] if entries else 0
 
 
+# ── files the agent sends (documents, images, audio) ─────────────────────────
+
+MAX_FILE = 25 * 1024 * 1024   # per file; the app keeps received files in the chat, so this bounds chat size
+FILE_TTL = 7 * 24 * 3600      # a file nobody downloaded for a week is cleaned up
+FILES_CAP = 1024 * 1024 * 1024  # total on disk; oldest go first
+_FILE_ID = re.compile(r"^[0-9a-f]{32}$")
+_AUDIO_EXT = {".mp3": "audio/mpeg", ".m4a": "audio/mp4", ".aac": "audio/aac", ".wav": "audio/wav",
+              ".ogg": "audio/ogg", ".opus": "audio/ogg", ".flac": "audio/flac", ".aiff": "audio/aiff", ".caf": "audio/x-caf"}
+
+
+class FileRejected(Exception):
+    """A file that can't be delivered (missing, unsafe, too big). The message is shown to the user."""
+
+
+def _files_dir() -> pathlib.Path:
+    d = _data_dir() / "files"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _safe_name(name: str) -> str:
+    base = os.path.basename(str(name or "")).strip()
+    base = "".join(ch for ch in base if ch.isprintable() and ch not in '/\\:*?"<>|')[:120].strip(" .")
+    return base or "file"
+
+
+def _mime_for(name: str) -> str:
+    ext = os.path.splitext(name)[1].lower()
+    return _AUDIO_EXT.get(ext) or mimetypes.guess_type(name)[0] or "application/octet-stream"
+
+
+def _kind_of_file(mime: str) -> str:
+    for prefix, kind in (("image/", "image"), ("audio/", "audio"), ("video/", "video")):
+        if mime.startswith(prefix):
+            return kind
+    return "file"
+
+
+def _human_size(n: int) -> str:
+    return f"{n / (1024 * 1024):.1f} MB" if n >= 1024 * 1024 else f"{max(1, n // 1024)} KB"
+
+
+def _store_file(path: str, voice: bool = False, name: Optional[str] = None) -> dict:
+    """Copy a file the agent produced into our own folder and describe it for the app. The copy means the agent
+    deleting a temp file (text-to-speech output, say) can't break delivery. Raises ``FileRejected``."""
+    safe = BasePlatformAdapter.validate_media_delivery_path(str(path))  # Hermes's own path safety, checked again
+    if not safe:
+        raise FileRejected("That file isn't available to send.")
+    src = pathlib.Path(safe)
+    try:
+        size = src.stat().st_size
+    except OSError:
+        raise FileRejected("That file isn't available to send.")
+    label = _safe_name(name or src.name)
+    if size > MAX_FILE:
+        raise FileRejected(f"{label} is too large to send to the app ({_human_size(size)}; the limit is {_human_size(MAX_FILE)}).")
+    fid = uuid.uuid4().hex
+    folder = _files_dir() / fid
+    folder.mkdir(parents=True)
+    try:
+        shutil.copyfile(src, folder / "blob")
+        mime = _mime_for(label)
+        meta = {"name": label, "mime": mime, "size": size, "created": time.time()}
+        (folder / "meta.json").write_text(json.dumps(meta))
+    except OSError as exc:
+        shutil.rmtree(folder, ignore_errors=True)
+        raise FileRejected(f"Couldn't prepare {label}: {exc.strerror or exc}")
+    return {"id": fid, "name": label, "mime": mime, "size": size, "kind": _kind_of_file(mime), "voice": bool(voice)}
+
+
+def _open_file(fid: str):
+    """(blob path, meta) for a stored file id, else None. Ids are random 128-bit hex, so there is no path to walk."""
+    if not _FILE_ID.match(fid or ""):
+        return None
+    folder = _files_dir() / fid
+    try:
+        meta = json.loads((folder / "meta.json").read_text())
+        blob = folder / "blob"
+        return (blob, meta) if blob.is_file() else None
+    except (OSError, ValueError):
+        return None
+
+
+def _cleanup_files() -> None:
+    """Drop files older than a week, then the oldest until the folder is under the cap."""
+    try:
+        entries = []
+        now = time.time()
+        for folder in _files_dir().iterdir():
+            blob = folder / "blob"
+            if not blob.is_file():
+                shutil.rmtree(folder, ignore_errors=True)
+                continue
+            age_ref = blob.stat().st_mtime
+            if now - age_ref > FILE_TTL:
+                shutil.rmtree(folder, ignore_errors=True)
+                continue
+            entries.append((age_ref, blob.stat().st_size, folder))
+        total = sum(e[1] for e in entries)
+        for _ts, size, folder in sorted(entries):
+            if total <= FILES_CAP:
+                break
+            shutil.rmtree(folder, ignore_errors=True)
+            total -= size
+    except OSError:
+        pass
+
+
+def _downgrade(entry: dict) -> dict:
+    """What an app that predates files sees: the text plus a plain note per attachment."""
+    out = {k: v for k, v in entry.items() if k != "attachments"}
+    notes = "\n".join(f"📎 {a.get('name', 'file')}" for a in entry.get("attachments") or [])
+    out["text"] = ((entry.get("text") or "") + ("\n\n" if entry.get("text") else "") + notes
+                   + "\n(Update the Hermes app to receive files.)").strip()
+    return out
+
+
 # ── minimal WebSocket (RFC 6455) ─────────────────────────────────────────────
 
 class _Closed(Exception):
@@ -174,8 +294,11 @@ class _Client:
         self.writer = writer
         self.authed = False
         self.device = ""
+        self.features: list = []  # what this app says it can do (e.g. "files"), sent in its hello
 
     async def send_json(self, obj: dict) -> None:
+        if obj.get("attachments") and "files" not in self.features:
+            obj = _downgrade(obj)
         self.writer.write(_frame(0x1, json.dumps(obj, separators=(",", ":")).encode()))
         await self.writer.drain()
 
@@ -269,6 +392,7 @@ class HermesAppAdapter(BasePlatformAdapter):
             return False
         try:
             _trim_log()
+            await asyncio.to_thread(_cleanup_files)
             self._offset = (_data_dir() / "log.jsonl").stat().st_size if (_data_dir() / "log.jsonl").exists() else 0
             self._server = await asyncio.start_server(self._on_connection, self.host, self.port)
         except OSError as exc:
@@ -315,6 +439,40 @@ class HermesAppAdapter(BasePlatformAdapter):
         self._remember_kind(mid, kind, metadata)
         entry = self._record({"t": "msg", "id": mid, "chat": str(chat_id), "text": content, "kind": kind})
         return SendResult(success=True, message_id=entry["id"])
+
+    async def _send_file(self, chat_id: str, path: str, caption: Optional[str], voice: bool = False,
+                         name: Optional[str] = None):
+        try:
+            att = await asyncio.to_thread(_store_file, path, voice, name)
+        except FileRejected as exc:
+            # Tell the user why in the chat, and let Hermes know the delivery failed.
+            self._record({"t": "msg", "id": uuid.uuid4().hex, "chat": str(chat_id), "text": f"📎 {exc}", "kind": "status"})
+            return SendResult(success=False, error=str(exc))
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Hermes App: could not store %s: %s", path, exc)
+            return SendResult(success=False, error=f"Could not prepare the file: {exc}")
+        mid = uuid.uuid4().hex
+        self._remember_kind(mid, "reply", None)
+        entry = self._record({"t": "msg", "id": mid, "chat": str(chat_id), "text": caption or "", "kind": "reply",
+                              "attachments": [att]})
+        return SendResult(success=True, message_id=entry["id"])
+
+    async def send_document(self, chat_id: str, file_path: str, caption: Optional[str] = None,
+                            file_name: Optional[str] = None, reply_to: Optional[str] = None,
+                            metadata: Optional[Dict[str, Any]] = None, **kwargs):
+        return await self._send_file(chat_id, file_path, caption, name=file_name)
+
+    async def send_image_file(self, chat_id: str, image_path: str, caption: Optional[str] = None,
+                              reply_to: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None, **kwargs):
+        return await self._send_file(chat_id, image_path, caption)
+
+    async def send_voice(self, chat_id: str, audio_path: str, caption: Optional[str] = None,
+                         reply_to: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None, **kwargs):
+        return await self._send_file(chat_id, audio_path, caption, voice=True)
+
+    async def send_video(self, chat_id: str, video_path: str, caption: Optional[str] = None,
+                         reply_to: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None, **kwargs):
+        return await self._send_file(chat_id, video_path, caption)
 
     async def send_or_update_status(self, chat_id: str, status_key: str, content: str, metadata=None):
         """Hermes routes the agent's own status lines here (memory recall, compaction, lifecycle notices): by
@@ -465,6 +623,9 @@ class HermesAppAdapter(BasePlatformAdapter):
                          + f"Content-Length: {len(body)}\r\n\r\n".encode() + body)
             await writer.drain()
             return False
+        if len(request) >= 2 and request[1].startswith("/f/"):
+            await self._serve_file(writer, request[1][3:].split("?", 1)[0], headers, head=request[0] == "HEAD")
+            return False
         key = headers.get("sec-websocket-key")
         if headers.get("upgrade", "").lower() != "websocket" or not key:
             writer.write(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
@@ -476,6 +637,39 @@ class HermesAppAdapter(BasePlatformAdapter):
         await writer.drain()
         return True
 
+    async def _serve_file(self, writer, fid: str, headers: dict, head: bool = False) -> None:
+        """GET /f/<id>: a file the agent sent. Needs the Hermes key as a bearer token; only files we stored."""
+        def reply(status: str, body: bytes = b"", extra: str = "") -> bytes:
+            return (f"HTTP/1.1 {status}\r\nConnection: close\r\nContent-Length: {len(body)}\r\n{extra}\r\n").encode() + body
+
+        offered = headers.get("authorization", "")
+        offered = offered[7:].strip() if offered.lower().startswith("bearer ") else ""
+        if not offered or not any(hmac.compare_digest(offered.encode(), k.encode()) for k in self.tokens):
+            writer.write(reply("401 Unauthorized"))
+            await writer.drain()
+            return
+        found = _open_file(fid)
+        if not found:
+            writer.write(reply("404 Not Found"))
+            await writer.drain()
+            return
+        blob, meta = found
+        quoted = urllib.parse.quote(meta.get("name", "file"))
+        head_text = ("HTTP/1.1 200 OK\r\nConnection: close\r\n"
+                     f"Content-Type: {meta.get('mime', 'application/octet-stream')}\r\n"
+                     f"Content-Length: {blob.stat().st_size}\r\n"
+                     f"Content-Disposition: attachment; filename*=UTF-8''{quoted}\r\n\r\n")
+        writer.write(head_text.encode())
+        if not head:
+            with open(blob, "rb") as fh:
+                while True:
+                    chunk = await asyncio.to_thread(fh.read, 65536)
+                    if not chunk:
+                        break
+                    writer.write(chunk)
+                    await writer.drain()
+        await writer.drain()
+
     async def _hello(self, client: _Client, msg: dict) -> bool:
         offered = str(msg.get("token", "")).encode()
         if msg.get("t") != "hello" or not any(hmac.compare_digest(offered, k.encode()) for k in self.tokens):
@@ -483,6 +677,7 @@ class HermesAppAdapter(BasePlatformAdapter):
             return False
         client.authed = True
         client.device = str(msg.get("device") or "")[:64]
+        client.features = [str(f) for f in (msg.get("features") or [])][:20]
         after = msg.get("after")
         latest = _latest_seq()
         await client.send_json({"t": "ready", "protocol": PROTOCOL, "version": PLUGIN_VERSION, "features": FEATURES,
@@ -651,12 +846,33 @@ def _env_enablement() -> Optional[dict]:
 
 async def _standalone_send(pconfig, chat_id: str, message: str, *, thread_id: Optional[str] = None,
                            media_files=None, force_document: bool = False) -> dict:
-    """Cron without a co-resident gateway: write to the log; the running gateway pushes it to the phone."""
+    """Cron without a co-resident gateway: write to the log (and copy any files); the running gateway pushes it to
+    the phone and serves the files."""
+    chat = str(chat_id or HOME_CHAT)
     try:
-        entry = _append({"t": "msg", "id": uuid.uuid4().hex, "chat": str(chat_id or HOME_CHAT), "text": message})
+        if not media_files:
+            entry = _append({"t": "msg", "id": uuid.uuid4().hex, "chat": chat, "text": message})
+            return {"success": True, "message_id": entry["id"]}
+        entry = None
+        problems = []
+        text = message
+        for item in media_files:
+            path, voice = (item[0], bool(item[1])) if isinstance(item, (list, tuple)) else (item, False)
+            try:
+                att = await asyncio.to_thread(_store_file, path, voice)
+            except FileRejected as exc:
+                problems.append(str(exc))
+                continue
+            entry = _append({"t": "msg", "id": uuid.uuid4().hex, "chat": chat, "kind": "reply",
+                             "text": text, "attachments": [att]})
+            text = ""  # the message text rides with the first file only
+        if entry is None:  # every file was refused: say so instead of dropping the delivery silently
+            entry = _append({"t": "msg", "id": uuid.uuid4().hex, "chat": chat,
+                             "text": "\n".join([message] + problems).strip(), "kind": "status"})
+            return {"error": "; ".join(problems) or "no files delivered"}
+        return {"success": True, "message_id": entry["id"]}
     except OSError as exc:
         return {"error": f"Hermes App log not writable: {exc}"}
-    return {"success": True, "message_id": entry["id"]}
 
 
 def register(ctx):
@@ -681,7 +897,9 @@ def register(ctx):
         platform_hint=(
             "You are chatting with the user through their own Hermes mobile app on their phone. "
             "Markdown is supported. You may send follow-up messages later (for example when a long task "
-            "finishes or a scheduled job runs); they arrive on the phone right away."))
+            "finishes or a scheduled job runs); they arrive on the phone right away. Deliver files by writing "
+            "MEDIA:/absolute/path/to/file on its own line: images, audio, video and documents (up to 25 MB) arrive as "
+            "attachments in the chat. Remote images render via ![alt](url)."))
     try:
         ctx.register_platform(**entry)
     except TypeError:  # an older Hermes that doesn't know a newer option: register without the extras
