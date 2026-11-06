@@ -1,0 +1,36 @@
+name: hermes-app
+label: Hermes App
+kind: platform
+version: 1.0.0
+description: >
+  Live connection for the Hermes mobile app. Adds the app as a messaging
+  platform, like Telegram or WhatsApp: one persistent WebSocket carries
+  messages both ways, including follow-ups and scheduled deliveries.
+  Plain Python standard library, no extra packages.
+author: Hermes App
+requires_env:
+  - name: API_SERVER_KEY
+    description: "The Hermes API key the app already chats with (set when the app was connected)"
+    prompt: "Hermes API key"
+    password: true
+optional_env:
+  - name: HERMES_APP_ENABLED
+    description: "Set to true to turn the Hermes App platform on"
+    prompt: "Enable? (true/false)"
+    password: false
+  - name: HERMES_APP_PORT
+    description: "Port the app connects to (default: 8648)"
+    prompt: "Port"
+    password: false
+  - name: HERMES_APP_HOST
+    description: "Address to listen on (default: 0.0.0.0 so a phone can reach it)"
+    prompt: "Listen address"
+    password: false
+  - name: HERMES_APP_HOME_CHANNEL
+    description: "Chat that scheduled jobs deliver to (default: home)"
+    prompt: "Home chat"
+    password: false
+  - name: HERMES_APP_TOKEN
+    description: "Older dedicated key (still accepted; not needed)"
+    prompt: "Key"
+    password: true
