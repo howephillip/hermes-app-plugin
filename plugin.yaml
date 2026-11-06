@@ -1,13 +1,15 @@
 name: hermes-app
 label: Hermes App
 kind: platform
-version: 1.1.0
+version: 1.2.0
 description: >
   Live connection for the Hermes mobile app. Adds the app as a messaging
   platform, like Telegram or WhatsApp: one persistent WebSocket carries
   messages both ways, including follow-ups and scheduled deliveries.
   Plain Python standard library, no extra packages.
 author: Hermes App
+provides_hooks:
+  - pre_tool_call
 requires_env:
   - name: API_SERVER_KEY
     description: "The Hermes API key the app already chats with (set when the app was connected)"

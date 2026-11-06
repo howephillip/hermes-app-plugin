@@ -28,6 +28,7 @@ import struct
 import subprocess
 import sys
 import time
+import unicodedata
 import uuid
 from collections import OrderedDict
 from typing import Any, Dict, Optional
@@ -42,9 +43,11 @@ logger = logging.getLogger(__name__)
 
 PLATFORM = "hermes_app"
 PLUGIN_NAME = "hermes-app"
-PLUGIN_VERSION = "1.1.0"  # keep in step with plugin.yaml; the app compares it to know when to offer an update
+PLUGIN_VERSION = "1.2.0"  # keep in step with plugin.yaml; the app compares it to know when to offer an update
 DEFAULT_PORT = 8648
 PROTOCOL = 1
+# What this plugin can do, announced to the app on connect so a newer app can tell what an older plugin lacks.
+FEATURES = ["kinds", "activity", "update"]
 LOG_KEEP = 5000  # entries kept in the log across restarts
 MAX_FRAME = 24 * 1024 * 1024  # a photo or two, base64 encoded
 MAX_REPLAY = 500
@@ -177,6 +180,58 @@ class _Client:
         await self.writer.drain()
 
 
+# ── what kind of message is this ─────────────────────────────────────────────
+
+_PROGRESS_VERBS = frozenset((
+    "Running", "Reading", "Writing", "Searching", "Fetching", "Editing", "Listing", "Browsing", "Using", "Calling",
+    "Executing", "Patching", "Scanning", "Opening", "Creating", "Deleting", "Installing", "Checking", "Looking",
+    "Analyzing", "Analysing", "Thinking", "Remembering", "Recalling", "Saving", "Updating", "Loading", "Querying",
+    "Downloading", "Uploading", "Navigating", "Clicking", "Typing", "Taking", "Delegating", "Planning", "Testing",
+    "Building", "Finding", "Grepping", "Globbing", "Viewing", "Copying", "Moving", "Fixing",
+))
+
+
+def _looks_like_progress(text: str) -> bool:
+    """Tool-progress bubbles Hermes builds ("💻 Running grep ...", "📖 Reading x.py"): every line is a symbol
+    followed by a known tool verb. Only used for sends Hermes did not label either way, and kept strict so an
+    ordinary reply that happens to start with an emoji is never taken for status."""
+    lines = [ln.strip() for ln in (text or "").splitlines() if ln.strip()]
+    if not lines or len(text) > 2000:
+        return False
+    for ln in lines:
+        if unicodedata.category(ln[0]) not in ("So", "Sk"):
+            return False
+        rest = ln[1:].lstrip("\ufe0f\u200d ").strip()
+        if not rest or rest.split(" ", 1)[0] not in _PROGRESS_VERBS:
+            return False
+    return True
+
+
+def _kind_for(content: str, metadata: Optional[dict]) -> str:
+    """"reply" (what the agent says to the user, spoken aloud in voice mode) or "status" (memory notices, interim
+    chatter, tool progress: shown quietly, never spoken).
+
+    Hermes labels what matters: a finished reply carries ``notify`` and mid-turn status carries ``_interim_send``.
+    Unlabelled sends are streamed answer chunks or tool-progress bubbles, told apart by their shape."""
+    md = metadata or {}
+    if md.get("_interim_send"):
+        return "status"
+    if md.get("notify"):
+        return "reply"
+    return "status" if _looks_like_progress(content) else "reply"
+
+
+def _brief(args) -> str:
+    """A short, readable hint of what a tool is doing, for the activity indicator."""
+    if not isinstance(args, dict):
+        return ""
+    for key in ("command", "cmd", "path", "file_path", "filename", "url", "query", "pattern", "name"):
+        val = args.get(key)
+        if isinstance(val, str) and val.strip():
+            return " ".join(val.split())[:80]
+    return ""
+
+
 # ── adapter ──────────────────────────────────────────────────────────────────
 
 class HermesAppAdapter(BasePlatformAdapter):
@@ -196,6 +251,9 @@ class HermesAppAdapter(BasePlatformAdapter):
         self._wake: Optional[asyncio.Event] = None  # set when this process appends, so delivery needn't wait for a poll
         self._offset = 0
         self._updating = False
+        self._active_chats: set = set()  # chats with a turn in flight, for attributing tool activity
+        self._kinds: "OrderedDict[str, str]" = OrderedDict()  # message id -> kind, so an edit keeps its message's kind
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._seen: "OrderedDict[str, None]" = OrderedDict()  # inbound ids already handled (client retries)
 
     @property
@@ -218,6 +276,8 @@ class HermesAppAdapter(BasePlatformAdapter):
             self._set_fatal_error("listen_failed", str(exc), retryable=True)
             return False
         self._wake = asyncio.Event()
+        self._loop = asyncio.get_running_loop()
+        _ACTIVE["adapter"] = self
         self._pump_task = asyncio.create_task(self._pump())
         self._mark_connected()
         logger.info("Hermes App: listening on %s:%s", self.host, self.port)
@@ -225,6 +285,8 @@ class HermesAppAdapter(BasePlatformAdapter):
         return True
 
     async def disconnect(self) -> None:
+        if _ACTIVE.get("adapter") is self:
+            _ACTIVE["adapter"] = None
         with contextlib.suppress(Exception):
             self._release_platform_lock()
         self._mark_disconnected()
@@ -248,11 +310,18 @@ class HermesAppAdapter(BasePlatformAdapter):
 
     async def send(self, chat_id: str, content: str, reply_to: Optional[str] = None,
                    metadata: Optional[Dict[str, Any]] = None):
-        entry = self._record({"t": "msg", "id": uuid.uuid4().hex, "chat": str(chat_id), "text": content})
+        kind = _kind_for(content, metadata)
+        mid = uuid.uuid4().hex
+        self._remember_kind(mid, kind, metadata)
+        entry = self._record({"t": "msg", "id": mid, "chat": str(chat_id), "text": content, "kind": kind})
         return SendResult(success=True, message_id=entry["id"])
 
     async def edit_message(self, chat_id: str, message_id: str, content: str, *, finalize: bool = False):
-        self._record({"t": "edit", "id": message_id, "chat": str(chat_id), "text": content})
+        # Status Hermes labelled stays status; anything else is re-judged as its text grows (streamed replies, and
+        # progress bubbles that are edited as more tools run).
+        kind = "status" if self._kinds.get(message_id) == "status:explicit" else _kind_for(content, None)
+        self._remember_kind(message_id, kind, None)
+        self._record({"t": "edit", "id": message_id, "chat": str(chat_id), "text": content, "kind": kind})
         return SendResult(success=True, message_id=message_id)
 
     async def send_typing(self, chat_id: str, metadata=None) -> None:
@@ -263,11 +332,29 @@ class HermesAppAdapter(BasePlatformAdapter):
 
     async def on_processing_complete(self, event, outcome) -> None:
         """The agent finished this turn (success or not): tell the phone so it stops showing 'working'."""
+        self._active_chats.discard(str(event.source.chat_id))
         # Through the log like messages, so "done" can never overtake the reply it closes.
         self._record({"t": "done", "chat": str(event.source.chat_id), "ok": getattr(outcome, "value", "") == "success"})
 
     async def get_chat_info(self, chat_id: str) -> dict:
         return {"name": "Hermes App", "type": "dm", "chat_id": chat_id}
+
+    def _remember_kind(self, mid: str, kind: str, metadata: Optional[dict]) -> None:
+        explicit = bool((metadata or {}).get("_interim_send"))
+        self._kinds[mid] = "status:explicit" if (explicit and kind == "status") else kind
+        while len(self._kinds) > 500:
+            self._kinds.popitem(last=False)
+
+    def emit_activity(self, tool: str, detail: str) -> None:
+        """Tell the phone which tool the agent is using (a quiet "working" line, never a chat message). Safe to call
+        from the agent's worker thread."""
+        loop = self._loop
+        if loop is None or loop.is_closed():
+            return
+        chats = list(self._active_chats) or [self._home_chat()]
+        frames = [{"t": "activity", "chat": c, "tool": tool, "detail": detail} for c in chats]
+        for frame in frames:
+            loop.call_soon_threadsafe(lambda f=frame: asyncio.ensure_future(self._broadcast(f)))
 
     def _record(self, entry: dict) -> dict:
         entry = _append(entry)
@@ -390,7 +477,7 @@ class HermesAppAdapter(BasePlatformAdapter):
         client.device = str(msg.get("device") or "")[:64]
         after = msg.get("after")
         latest = _latest_seq()
-        await client.send_json({"t": "ready", "protocol": PROTOCOL, "version": PLUGIN_VERSION,
+        await client.send_json({"t": "ready", "protocol": PROTOCOL, "version": PLUGIN_VERSION, "features": FEATURES,
                                 "latest": latest, "home": self._home_chat()})
         if isinstance(after, int) and after < latest:
             for entry in _read_log(after):
@@ -445,6 +532,7 @@ class HermesAppAdapter(BasePlatformAdapter):
         await client.send_json({"t": "ack", "id": mid})
         if mid in self._seen:
             return
+        self._active_chats.add(chat)
         self._seen[mid] = None
         while len(self._seen) > 500:
             self._seen.popitem(last=False)
@@ -482,6 +570,18 @@ class HermesAppAdapter(BasePlatformAdapter):
 
 
 # ── plugin registration ──────────────────────────────────────────────────────
+
+_ACTIVE: dict = {"adapter": None}
+
+
+def _on_pre_tool_call(tool_name: str = "", args=None, **_kw):
+    """Hermes hook: a tool is about to run. Report it to the phone as quiet activity. Never alters the call."""
+    adapter = _ACTIVE.get("adapter")
+    if adapter is not None and tool_name:
+        with contextlib.suppress(Exception):
+            adapter.emit_activity(str(tool_name), _brief(args))
+    return None
+
 
 def _hermes_cmd() -> list:
     """How to run the `hermes` command from inside the gateway, which may not have it on its PATH."""
@@ -552,7 +652,7 @@ async def _standalone_send(pconfig, chat_id: str, message: str, *, thread_id: Op
 
 
 def register(ctx):
-    ctx.register_platform(
+    entry = dict(
         name=PLATFORM,
         label="Hermes App",
         adapter_factory=HermesAppAdapter,
@@ -567,7 +667,17 @@ def register(ctx):
         allow_all_env="HERMES_APP_ALLOW_ALL_USERS",
         emoji="📱",
         pii_safe=False,
+        # The app shows tool activity itself (from the hook below), so Hermes's text progress lines are off by
+        # default for this platform. A user's own display settings still win.
+        display_overrides={"tool_progress": "off", "show_reasoning": False},
         platform_hint=(
             "You are chatting with the user through their own Hermes mobile app on their phone. "
             "Markdown is supported. You may send follow-up messages later (for example when a long task "
             "finishes or a scheduled job runs); they arrive on the phone right away."))
+    try:
+        ctx.register_platform(**entry)
+    except TypeError:  # an older Hermes that doesn't know a newer option: register without the extras
+        entry.pop("display_overrides", None)
+        ctx.register_platform(**entry)
+    with contextlib.suppress(Exception):
+        ctx.register_hook("pre_tool_call", _on_pre_tool_call)
