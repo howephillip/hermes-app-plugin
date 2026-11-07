@@ -46,7 +46,7 @@ logger = logging.getLogger(__name__)
 
 PLATFORM = "hermes_app"
 PLUGIN_NAME = "hermes-app"
-PLUGIN_VERSION = "1.5.4"  # keep in step with plugin.yaml; the app compares it to know when to offer an update
+PLUGIN_VERSION = "1.5.5"  # keep in step with plugin.yaml; the app compares it to know when to offer an update
 DEFAULT_PORT = 8648
 PROTOCOL = 1
 # What this plugin can do, announced to the app on connect so a newer app can tell what an older plugin lacks.
@@ -382,6 +382,7 @@ class HermesAppAdapter(BasePlatformAdapter):
         self._updating = False
         self._active_chats: set = set()  # chats with a turn in flight, for attributing tool activity
         self._active_since: Dict[str, float] = {}  # chat -> when its turn began, so a turn that never reported back expires
+        self._turn_session: Dict[str, str] = {}  # chat -> the agent run streaming its open turn (the first to speak)
         self._stream_noted: set = set()  # what the log already said about streaming, so it says it once
         self._kinds: "OrderedDict[str, str]" = OrderedDict()  # message id -> kind, so an edit keeps its message's kind
         self._loop: Optional[asyncio.AbstractEventLoop] = None
@@ -461,20 +462,26 @@ class HermesAppAdapter(BasePlatformAdapter):
 
     STREAM_EVERY = 0.3  # seconds between updates to the phone (each is one log entry)
 
-    def stream_event(self, event: str, payload: dict) -> None:
-        """Called from Hermes's stream hooks on a worker thread."""
+    def stream_event(self, event: str, payload: dict, owner: tuple = ("", "")) -> None:
+        """Called from Hermes's stream hooks on a worker thread. `owner` is (chat, session) of the turn the words
+        were written in, read from Hermes's per-turn context where it has one (see `_turn_owner`)."""
         loop = self._loop
         if loop is None or loop.is_closed():
             return
-        loop.call_soon_threadsafe(self._stream_apply, event, payload)
+        loop.call_soon_threadsafe(self._stream_apply, event, payload, owner)
 
-    def _stream_chat(self) -> Optional[str]:
-        # The hook says which platform spoke but not which chat; with exactly one turn in flight it is that one.
-        # With several at once it can't be told, so nothing is streamed and the whole reply arrives as before.
+    def _stream_chat(self, hint: str = "") -> Optional[str]:
         now = time.monotonic()
         for chat in [c for c in self._active_chats if now - self._active_since.get(c, now) > 900]:
             self._active_chats.discard(chat)  # a turn that never reported back must not block streaming for ever
             self._active_since.pop(chat, None)
+        if hint:
+            # Hermes said which chat this turn belongs to. A chat with no turn in flight (the turn already finished,
+            # or a scheduled job on this platform) gets nothing streamed; its message still arrives whole.
+            self._note_stream("by-chat", "Hermes App: streaming each turn to its own chat")
+            return hint if hint in self._active_chats else None
+        # An older Hermes doesn't say which chat; with exactly one turn in flight it is that one.
+        # With several at once it can't be told, so nothing is streamed and the whole reply arrives as before.
         chats = list(self._active_chats)
         if len(chats) != 1:
             self._note_stream("ambiguous:%s" % ",".join(sorted(chats)),
@@ -489,9 +496,15 @@ class HermesAppAdapter(BasePlatformAdapter):
             self._stream_noted.add(key)
             logger.info(message)
 
-    def _stream_apply(self, event: str, payload: dict) -> None:
-        chat = self._stream_chat()
+    def _stream_apply(self, event: str, payload: dict, owner: tuple = ("", "")) -> None:
+        chat = self._stream_chat(owner[0])
         if chat is None:
+            return
+        session = str(payload.get("session_id") or "")
+        if session and self._turn_session.setdefault(chat, session) != session:
+            # A second agent run in the same chat while its turn is open, such as Hermes's background memory review
+            # (it runs as this platform with its own session). The turn's own reply is always the first to speak.
+            self._note_stream("other-run", "Hermes App: not streaming a second agent run in a turn (e.g. memory review)")
             return
         open_ = self._streams.setdefault(chat, [])
         if event == "on_stream_start":
@@ -630,6 +643,7 @@ class HermesAppAdapter(BasePlatformAdapter):
         self._finish_streams(str(event.source.chat_id))
         self._active_chats.discard(str(event.source.chat_id))
         self._active_since.pop(str(event.source.chat_id), None)
+        self._turn_session.pop(str(event.source.chat_id), None)
         # Through the log like messages, so "done" can never overtake the reply it closes.
         self._record({"t": "done", "chat": str(event.source.chat_id), "ok": getattr(outcome, "value", "") == "success"})
 
@@ -889,6 +903,7 @@ class HermesAppAdapter(BasePlatformAdapter):
             return
         self._active_chats.add(chat)
         self._active_since[chat] = time.monotonic()
+        self._turn_session.pop(chat, None)
         self._seen[mid] = None
         while len(self._seen) > 500:
             self._seen.popitem(last=False)
@@ -950,6 +965,26 @@ def _on_pre_tool_call(tool_name: str = "", args=None, **_kw):
 _STREAM_EVENTS = ("on_stream_start", "on_stream_delta", "on_stream_end")
 
 
+def _turn_owner() -> tuple:
+    """(chat, session) of the gateway turn running on this thread, from Hermes's per-turn context; empty strings
+    where Hermes doesn't say (then streaming falls back to "the one chat in flight"). Read where the words are
+    written, so it is the writer's own turn. Only trusted for this platform. Only the chat is used for routing: Hermes
+    rebinds the session to each agent it builds, so it can't tell a background run from the reply."""
+    try:
+        # The task-local values only: Hermes also mirrors the session id into os.environ for the whole process, which
+        # on a busy gateway can be another chat's.
+        from gateway.session_context import _VAR_MAP
+
+        def value(name: str) -> str:
+            got = _VAR_MAP[name].get()
+            return got if isinstance(got, str) else ""
+        if value("HERMES_SESSION_PLATFORM") != PLATFORM:
+            return ("", "")
+        return (value("HERMES_SESSION_CHAT_ID"), value("HERMES_SESSION_ID"))
+    except Exception:  # noqa: BLE001 - not this Hermes
+        return ("", "")
+
+
 def _install_stream_tap() -> bool:
     """Listen to the model's words for every agent, not just the one this plugin is installed in.
 
@@ -973,7 +1008,7 @@ def _install_stream_tap() -> bool:
             adapter = _ACTIVE.get("adapter")
             if adapter is not None:
                 with contextlib.suppress(Exception):
-                    adapter.stream_event(hook_name, payload)
+                    adapter.stream_event(hook_name, payload, _turn_owner())
         return queued
 
     def has_observers():
@@ -1003,7 +1038,7 @@ def _stream_hook(event: str):
         with contextlib.suppress(Exception):
             adapter._note_stream("ours", "Hermes App: stream hook is receiving this app's replies")
         with contextlib.suppress(Exception):
-            adapter.stream_event(event, payload)
+            adapter.stream_event(event, payload, _turn_owner())
         return None
     hook.__name__ = event + "_hermes_app"
     return hook
