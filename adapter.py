@@ -46,7 +46,7 @@ logger = logging.getLogger(__name__)
 
 PLATFORM = "hermes_app"
 PLUGIN_NAME = "hermes-app"
-PLUGIN_VERSION = "1.5.0"  # keep in step with plugin.yaml; the app compares it to know when to offer an update
+PLUGIN_VERSION = "1.5.1"  # keep in step with plugin.yaml; the app compares it to know when to offer an update
 DEFAULT_PORT = 8648
 PROTOCOL = 1
 # What this plugin can do, announced to the app on connect so a newer app can tell what an older plugin lacks.
@@ -381,6 +381,8 @@ class HermesAppAdapter(BasePlatformAdapter):
         self._offset = 0
         self._updating = False
         self._active_chats: set = set()  # chats with a turn in flight, for attributing tool activity
+        self._active_since: Dict[str, float] = {}  # chat -> when its turn began, so a turn that never reported back expires
+        self._stream_noted: set = set()  # what the log already said about streaming, so it says it once
         self._kinds: "OrderedDict[str, str]" = OrderedDict()  # message id -> kind, so an edit keeps its message's kind
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._seen: "OrderedDict[str, None]" = OrderedDict()  # inbound ids already handled (client retries)
@@ -469,8 +471,23 @@ class HermesAppAdapter(BasePlatformAdapter):
     def _stream_chat(self) -> Optional[str]:
         # The hook says which platform spoke but not which chat; with exactly one turn in flight it is that one.
         # With several at once it can't be told, so nothing is streamed and the whole reply arrives as before.
+        now = time.monotonic()
+        for chat in [c for c in self._active_chats if now - self._active_since.get(c, now) > 900]:
+            self._active_chats.discard(chat)  # a turn that never reported back must not block streaming for ever
+            self._active_since.pop(chat, None)
         chats = list(self._active_chats)
-        return chats[0] if len(chats) == 1 else None
+        if len(chats) != 1:
+            self._note_stream("ambiguous:%s" % ",".join(sorted(chats)),
+                              "Hermes App: not streaming, %d chats in flight %s" % (len(chats), sorted(chats)))
+            return None
+        return chats[0]
+
+    def _note_stream(self, key: str, message: str) -> None:
+        if key not in self._stream_noted:
+            if len(self._stream_noted) > 50:
+                self._stream_noted.clear()
+            self._stream_noted.add(key)
+            logger.info(message)
 
     def _stream_apply(self, event: str, payload: dict) -> None:
         chat = self._stream_chat()
@@ -612,6 +629,7 @@ class HermesAppAdapter(BasePlatformAdapter):
         """The agent finished this turn (success or not): tell the phone so it stops showing 'working'."""
         self._finish_streams(str(event.source.chat_id))
         self._active_chats.discard(str(event.source.chat_id))
+        self._active_since.pop(str(event.source.chat_id), None)
         # Through the log like messages, so "done" can never overtake the reply it closes.
         self._record({"t": "done", "chat": str(event.source.chat_id), "ok": getattr(outcome, "value", "") == "success"})
 
@@ -870,6 +888,7 @@ class HermesAppAdapter(BasePlatformAdapter):
         if mid in self._seen:
             return
         self._active_chats.add(chat)
+        self._active_since[chat] = time.monotonic()
         self._seen[mid] = None
         while len(self._seen) > 500:
             self._seen.popitem(last=False)
@@ -925,8 +944,15 @@ def _stream_hook(event: str):
     only: it never alters what Hermes does, and any trouble stays inside it."""
     def hook(**payload):
         adapter = _ACTIVE.get("adapter")
-        if adapter is None or payload.get("surface") != PLATFORM:
+        if adapter is None:
             return None
+        if payload.get("surface") != PLATFORM:
+            with contextlib.suppress(Exception):
+                adapter._note_stream("surface:%s" % payload.get("surface"),
+                                     "Hermes App: stream hook saw surface %r (not ours)" % (payload.get("surface"),))
+            return None
+        with contextlib.suppress(Exception):
+            adapter._note_stream("ours", "Hermes App: stream hook is receiving this app's replies")
         with contextlib.suppress(Exception):
             adapter.stream_event(event, payload)
         return None
