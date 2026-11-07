@@ -46,7 +46,7 @@ logger = logging.getLogger(__name__)
 
 PLATFORM = "hermes_app"
 PLUGIN_NAME = "hermes-app"
-PLUGIN_VERSION = "1.4.0"  # keep in step with plugin.yaml; the app compares it to know when to offer an update
+PLUGIN_VERSION = "1.4.1"  # keep in step with plugin.yaml; the app compares it to know when to offer an update
 DEFAULT_PORT = 8648
 PROTOCOL = 1
 # What this plugin can do, announced to the app on connect so a newer app can tell what an older plugin lacks.
@@ -185,6 +185,7 @@ def _store_file(path: str, voice: bool = False, name: Optional[str] = None) -> d
     folder.mkdir(parents=True)
     try:
         shutil.copyfile(src, folder / "blob")
+        label, size = _make_playable(folder, label, size)
         mime = _mime_for(label)
         meta = {"name": label, "mime": mime, "size": size, "created": time.time()}
         (folder / "meta.json").write_text(json.dumps(meta))
@@ -192,6 +193,32 @@ def _store_file(path: str, voice: bool = False, name: Optional[str] = None) -> d
         shutil.rmtree(folder, ignore_errors=True)
         raise FileRejected(f"Couldn't prepare {label}: {exc.strerror or exc}")
     return {"id": fid, "name": label, "mime": mime, "size": size, "kind": _kind_of_file(mime), "voice": bool(voice)}
+
+
+def _make_playable(folder: pathlib.Path, label: str, size: int):
+    """iPhones can't play Ogg/Opus (what Hermes makes for a voice note when the speech provider is marked
+    voice-compatible). Turn it into AAC (.m4a) with ffmpeg when we can; otherwise leave the file as it is.
+    Returns (label, size)."""
+    if os.path.splitext(label)[1].lower() not in (".ogg", ".opus", ".oga"):
+        return label, size
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        return label, size
+    out = folder / "playable.m4a"
+    try:
+        subprocess.run([ffmpeg, "-v", "error", "-y", "-i", str(folder / "blob"), "-vn", "-c:a", "aac", "-b:a", "64k",
+                        str(out)], check=True, timeout=60, stdin=subprocess.DEVNULL,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        new_size = out.stat().st_size
+        if new_size <= 0:
+            raise OSError("empty output")
+        os.replace(out, folder / "blob")
+        return os.path.splitext(label)[0] + ".m4a", new_size
+    except (OSError, subprocess.SubprocessError) as exc:
+        logger.info("Hermes App: could not convert %s for the phone: %s", label, exc)
+        with contextlib.suppress(OSError):
+            out.unlink()
+        return label, size
 
 
 def _open_file(fid: str):
@@ -314,6 +341,10 @@ _PROGRESS_VERBS = frozenset((
 ))
 
 
+# "⚙️ tool_search: ..." : a tool's own name (snake_case with an underscore) followed by a colon
+_TOOL_NAME_LABEL = re.compile(r"^[a-z][a-z0-9]*(_[a-z0-9]+)+:$")
+
+
 def _looks_like_progress(text: str) -> bool:
     """Tool-progress bubbles Hermes builds ("💻 Running grep ...", "📖 Reading x.py"): every line is a symbol
     followed by a known tool verb. Only used for sends Hermes did not label either way, and kept strict so an
@@ -325,7 +356,8 @@ def _looks_like_progress(text: str) -> bool:
         if unicodedata.category(ln[0]) not in ("So", "Sk"):
             return False
         rest = ln[1:].lstrip("\ufe0f\u200d ").strip()
-        if not rest or rest.split(" ", 1)[0] not in _PROGRESS_VERBS:
+        word = rest.split(" ", 1)[0] if rest else ""
+        if not word or (word not in _PROGRESS_VERBS and not _TOOL_NAME_LABEL.match(word)):
             return False
     return True
 
