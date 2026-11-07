@@ -46,7 +46,7 @@ logger = logging.getLogger(__name__)
 
 PLATFORM = "hermes_app"
 PLUGIN_NAME = "hermes-app"
-PLUGIN_VERSION = "1.5.2"  # keep in step with plugin.yaml; the app compares it to know when to offer an update
+PLUGIN_VERSION = "1.5.3"  # keep in step with plugin.yaml; the app compares it to know when to offer an update
 DEFAULT_PORT = 8648
 PROTOCOL = 1
 # What this plugin can do, announced to the app on connect so a newer app can tell what an older plugin lacks.
@@ -943,6 +943,44 @@ def _on_pre_tool_call(tool_name: str = "", args=None, **_kw):
     return None
 
 
+_STREAM_EVENTS = ("on_stream_start", "on_stream_delta", "on_stream_end")
+
+
+def _install_stream_tap() -> bool:
+    """Listen to the model's words for every agent, not just the one this plugin is installed in.
+
+    Hermes runs each agent profile in its own plugin scope and only calls hooks registered in that scope, so a hook
+    registered here never hears a turn in another profile (and this plugin is installed once, in the main one). The
+    stream events all pass through one function in the process, so this watches that function from the gateway: it
+    adds a copy for our adapter and changes nothing about what Hermes does. Also tells Hermes someone is listening,
+    which is what makes it hand out the words at all. Returns False (and the ordinary hooks are used instead, which
+    cover the main agent only) if Hermes no longer has that function."""
+    if sys.__dict__.get("_hermes_app_stream_tap"):
+        return True
+    try:
+        import agent.plugin_stream_hooks as hooks
+        original_enqueue, original_has = hooks.enqueue_plugin_stream_hook, hooks.has_stream_observer_hooks
+    except Exception:  # noqa: BLE001 - not this Hermes
+        return False
+
+    def enqueue(hook_name, **payload):
+        queued = original_enqueue(hook_name, **payload)
+        if hook_name in _STREAM_EVENTS and payload.get("surface") == PLATFORM:
+            adapter = _ACTIVE.get("adapter")
+            if adapter is not None:
+                with contextlib.suppress(Exception):
+                    adapter.stream_event(hook_name, payload)
+        return queued
+
+    def has_observers():
+        return bool(original_has()) or _ACTIVE.get("adapter") is not None
+
+    hooks.enqueue_plugin_stream_hook = enqueue
+    hooks.has_stream_observer_hooks = has_observers
+    sys.__dict__["_hermes_app_stream_tap"] = True
+    return True
+
+
 def _stream_hook(event: str):
     """Hermes hook: the model is writing. Passes our own platform's words on to the phone as they come. Observer
     only: it never alters what Hermes does, and any trouble stays inside it."""
@@ -1323,6 +1361,9 @@ def register(ctx):
         ctx.register_platform(**entry)
     with contextlib.suppress(Exception):
         ctx.register_hook("pre_tool_call", _on_pre_tool_call)
-    for event in ("on_stream_start", "on_stream_delta", "on_stream_end"):
-        with contextlib.suppress(Exception):  # an older Hermes without these hooks just doesn't stream
-            ctx.register_hook(event, _stream_hook(event))
+    if _install_stream_tap():
+        logger.info("Hermes App: streaming tap installed")
+    else:
+        for event in _STREAM_EVENTS:
+            with contextlib.suppress(Exception):  # an older Hermes without these hooks just doesn't stream
+                ctx.register_hook(event, _stream_hook(event))
