@@ -46,11 +46,11 @@ logger = logging.getLogger(__name__)
 
 PLATFORM = "hermes_app"
 PLUGIN_NAME = "hermes-app"
-PLUGIN_VERSION = "1.4.3"  # keep in step with plugin.yaml; the app compares it to know when to offer an update
+PLUGIN_VERSION = "1.5.0"  # keep in step with plugin.yaml; the app compares it to know when to offer an update
 DEFAULT_PORT = 8648
 PROTOCOL = 1
 # What this plugin can do, announced to the app on connect so a newer app can tell what an older plugin lacks.
-FEATURES = ["kinds", "activity", "update", "files", "agents"]
+FEATURES = ["kinds", "activity", "update", "files", "agents", "streaming"]
 LOG_KEEP = 5000  # entries kept in the log across restarts
 MAX_FRAME = 24 * 1024 * 1024  # a photo or two, base64 encoded
 MAX_REPLAY = 500
@@ -310,7 +310,8 @@ _PROGRESS_VERBS = frozenset((
     "Executing", "Patching", "Scanning", "Opening", "Creating", "Deleting", "Installing", "Checking", "Looking",
     "Analyzing", "Analysing", "Thinking", "Remembering", "Recalling", "Saving", "Updating", "Loading", "Querying",
     "Downloading", "Uploading", "Navigating", "Clicking", "Typing", "Taking", "Delegating", "Planning", "Testing",
-    "Building", "Finding", "Grepping", "Globbing", "Viewing", "Copying", "Moving", "Fixing",
+    "Building", "Finding", "Grepping", "Globbing", "Viewing", "Copying", "Moving", "Fixing", "Generating",
+    "Synthesizing", "Synthesising", "Transcribing", "Converting", "Rendering",
 ))
 
 
@@ -383,6 +384,10 @@ class HermesAppAdapter(BasePlatformAdapter):
         self._kinds: "OrderedDict[str, str]" = OrderedDict()  # message id -> kind, so an edit keeps its message's kind
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._seen: "OrderedDict[str, None]" = OrderedDict()  # inbound ids already handled (client retries)
+        # Replies being written right now, per chat: [{mid, text, sent, at, ended, timer}]. Hermes has gateway streaming
+        # off for most people and won't let a plugin switch it on, so the plugin watches the model's words itself and
+        # shows them as they come; Hermes's own final message is then folded into the same bubble (see _claim_stream).
+        self._streams: Dict[str, list] = {}
 
     @property
     def name(self) -> str:
@@ -440,10 +445,112 @@ class HermesAppAdapter(BasePlatformAdapter):
     async def send(self, chat_id: str, content: str, reply_to: Optional[str] = None,
                    metadata: Optional[Dict[str, Any]] = None):
         kind = _kind_for(content, metadata)
+        claimed = self._claim_stream(str(chat_id), content)
+        if claimed:  # the words were already on the phone as they were written: finish that bubble, don't add another
+            self._remember_kind(claimed, kind, metadata)
+            self._record({"t": "edit", "id": claimed, "chat": str(chat_id), "text": content, "kind": kind})
+            return SendResult(success=True, message_id=claimed)
         mid = uuid.uuid4().hex
         self._remember_kind(mid, kind, metadata)
         entry = self._record({"t": "msg", "id": mid, "chat": str(chat_id), "text": content, "kind": kind})
         return SendResult(success=True, message_id=entry["id"])
+
+    # -- streaming: the model's words, as they are written --------------------
+
+    STREAM_EVERY = 0.3  # seconds between updates to the phone (each is one log entry)
+
+    def stream_event(self, event: str, payload: dict) -> None:
+        """Called from Hermes's stream hooks on a worker thread."""
+        loop = self._loop
+        if loop is None or loop.is_closed():
+            return
+        loop.call_soon_threadsafe(self._stream_apply, event, payload)
+
+    def _stream_chat(self) -> Optional[str]:
+        # The hook says which platform spoke but not which chat; with exactly one turn in flight it is that one.
+        # With several at once it can't be told, so nothing is streamed and the whole reply arrives as before.
+        chats = list(self._active_chats)
+        return chats[0] if len(chats) == 1 else None
+
+    def _stream_apply(self, event: str, payload: dict) -> None:
+        chat = self._stream_chat()
+        if chat is None:
+            return
+        open_ = self._streams.setdefault(chat, [])
+        if event == "on_stream_start":
+            open_.append({"mid": None, "text": "", "sent": "", "at": 0.0, "ended": False, "timer": None})
+            del open_[:-8]
+            return
+        if not open_ or open_[-1]["ended"]:
+            if event == "on_stream_end":
+                return
+            open_.append({"mid": None, "text": "", "sent": "", "at": 0.0, "ended": False, "timer": None})
+        state = open_[-1]
+        if event == "on_stream_delta":
+            if payload.get("kind", "text") != "text":
+                return
+            state["text"] += str(payload.get("delta") or "")
+            self._stream_flush(chat, state, force=False)
+        elif event == "on_stream_end":
+            state["ended"] = True
+            self._stream_flush(chat, state, force=True)
+
+    def _stream_flush(self, chat: str, state: dict, force: bool) -> None:
+        loop = self._loop
+        now = time.monotonic()
+        if not force and now - state["at"] < self.STREAM_EVERY:
+            if state["timer"] is None and loop is not None:
+                state["timer"] = loop.call_later(self.STREAM_EVERY, self._stream_flush_later, chat, state)
+            return
+        self._stream_cancel_timer(state)
+        text = state["text"]
+        if not text.strip() or text == state["sent"]:
+            return
+        state["at"], state["sent"] = now, text
+        if state["mid"] is None:
+            state["mid"] = uuid.uuid4().hex
+            self._remember_kind(state["mid"], "reply", None)
+            self._record({"t": "msg", "id": state["mid"], "chat": chat, "text": text, "kind": "reply"})
+        else:
+            self._record({"t": "edit", "id": state["mid"], "chat": chat, "text": text, "kind": "reply"})
+
+    def _stream_flush_later(self, chat: str, state: dict) -> None:
+        state["timer"] = None
+        self._stream_flush(chat, state, force=True)
+
+    @staticmethod
+    def _stream_cancel_timer(state: dict) -> None:
+        timer = state.get("timer")
+        if timer is not None:
+            timer.cancel()
+        state["timer"] = None
+
+    @staticmethod
+    def _same_words(a: str, b: str) -> bool:
+        a, b = " ".join(a.split()), " ".join(b.split())
+        if not a or not b:
+            return False
+        key = min(40, len(a), len(b))
+        if key >= 8 and a[:key] == b[:key]:
+            return True
+        short, long_ = (a, b) if len(a) <= len(b) else (b, a)
+        return len(short) >= 20 and short in long_
+
+    def _claim_stream(self, chat: str, content: str) -> Optional[str]:
+        """The streamed bubble that is this same text, if there is one: it is then finished with Hermes's final wording
+        instead of a second bubble being added."""
+        open_ = self._streams.get(chat) or []
+        for state in reversed(open_):
+            if state["mid"] and self._same_words(state["text"], content):
+                self._stream_cancel_timer(state)
+                open_.remove(state)
+                return state["mid"]
+        return None
+
+    def _finish_streams(self, chat: str) -> None:
+        for state in self._streams.pop(chat, []):
+            self._stream_flush(chat, state, force=True)
+            self._stream_cancel_timer(state)
 
     async def _send_file(self, chat_id: str, path: str, caption: Optional[str], voice: bool = False,
                          name: Optional[str] = None):
@@ -503,6 +610,7 @@ class HermesAppAdapter(BasePlatformAdapter):
 
     async def on_processing_complete(self, event, outcome) -> None:
         """The agent finished this turn (success or not): tell the phone so it stops showing 'working'."""
+        self._finish_streams(str(event.source.chat_id))
         self._active_chats.discard(str(event.source.chat_id))
         # Through the log like messages, so "done" can never overtake the reply it closes.
         self._record({"t": "done", "chat": str(event.source.chat_id), "ok": getattr(outcome, "value", "") == "success"})
@@ -810,6 +918,20 @@ def _on_pre_tool_call(tool_name: str = "", args=None, **_kw):
         with contextlib.suppress(Exception):
             adapter.emit_activity(str(tool_name), _brief(args))
     return None
+
+
+def _stream_hook(event: str):
+    """Hermes hook: the model is writing. Passes our own platform's words on to the phone as they come. Observer
+    only: it never alters what Hermes does, and any trouble stays inside it."""
+    def hook(**payload):
+        adapter = _ACTIVE.get("adapter")
+        if adapter is None or payload.get("surface") != PLATFORM:
+            return None
+        with contextlib.suppress(Exception):
+            adapter.stream_event(event, payload)
+        return None
+    hook.__name__ = event + "_hermes_app"
+    return hook
 
 
 def _hermes_cmd() -> list:
@@ -1168,3 +1290,6 @@ def register(ctx):
         ctx.register_platform(**entry)
     with contextlib.suppress(Exception):
         ctx.register_hook("pre_tool_call", _on_pre_tool_call)
+    for event in ("on_stream_start", "on_stream_delta", "on_stream_end"):
+        with contextlib.suppress(Exception):  # an older Hermes without these hooks just doesn't stream
+            ctx.register_hook(event, _stream_hook(event))
