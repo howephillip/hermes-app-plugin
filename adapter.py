@@ -46,7 +46,7 @@ logger = logging.getLogger(__name__)
 
 PLATFORM = "hermes_app"
 PLUGIN_NAME = "hermes-app"
-PLUGIN_VERSION = "1.4.2"  # keep in step with plugin.yaml; the app compares it to know when to offer an update
+PLUGIN_VERSION = "1.4.3"  # keep in step with plugin.yaml; the app compares it to know when to offer an update
 DEFAULT_PORT = 8648
 PROTOCOL = 1
 # What this plugin can do, announced to the app on connect so a newer app can tell what an older plugin lacks.
@@ -1109,7 +1109,39 @@ PLATFORM_HINT = (
 )
 
 
+TOOLSET_NAME = "hermes-" + PLATFORM  # the name Hermes looks up for a platform with no saved tool list
+
+
+def _ensure_toolset():
+    """Gives the app's chats the same tools a Telegram chat gets (voice replies, files, memory...).
+
+    Hermes picks a chat's tools from a toolset named after its platform; with none defined the app's agents silently
+    got almost no tools (no text_to_speech, so no voice notes). Defined in memory at startup: nothing is written to
+    any profile's config, a toolset the user defined themselves is left alone, and each profile's own disabled
+    toolsets still apply on top. Returns what happened, for the log and the tests."""
+    try:
+        import toolsets
+    except Exception:
+        return "no-toolsets-module"
+    try:
+        if toolsets.TOOLSETS.get(TOOLSET_NAME):
+            return "already-defined"
+        if toolsets.TOOLSETS.get("hermes-telegram"):
+            toolsets.create_custom_toolset(
+                TOOLSET_NAME, "Hermes App chats: the same full toolset as a personal Telegram chat",
+                includes=["hermes-telegram"])
+            return "included-telegram"
+        core = list(getattr(toolsets, "_HERMES_CORE_TOOLS", []))
+        if core:
+            toolsets.create_custom_toolset(TOOLSET_NAME, "Hermes App chats: the core tools", tools=core)
+            return "core-tools"
+    except Exception:
+        logger.warning("Hermes App: could not define the app toolset", exc_info=True)
+    return "failed"
+
+
 def register(ctx):
+    logger.info("Hermes App: toolset %s", _ensure_toolset())
     entry = dict(
         name=PLATFORM,
         label="Hermes App",
