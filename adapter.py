@@ -46,7 +46,7 @@ logger = logging.getLogger(__name__)
 
 PLATFORM = "hermes_app"
 PLUGIN_NAME = "hermes-app"
-PLUGIN_VERSION = "1.5.3"  # keep in step with plugin.yaml; the app compares it to know when to offer an update
+PLUGIN_VERSION = "1.5.4"  # keep in step with plugin.yaml; the app compares it to know when to offer an update
 DEFAULT_PORT = 8648
 PROTOCOL = 1
 # What this plugin can do, announced to the app on connect so a newer app can tell what an older plugin lacks.
@@ -904,6 +904,10 @@ class HermesAppAdapter(BasePlatformAdapter):
         source = self.build_source(chat_id=chat, chat_name="Hermes App", chat_type="dm",
                                    user_id="app-user", user_name="App")
         guidance = str(msg.get("guidance") or "").strip()[:2000] or None  # per-message hints from the app
+        # What the app asked for this turn (the instruction, never the user's words), so "was it told to use voice?"
+        # can be answered from the log.
+        logger.info("Hermes App: turn in %s, instruction %s", chat,
+                    "none" if not guidance else "%d chars: %r" % (len(guidance), guidance[:90]))
         event = MessageEvent(text=text, message_type=MessageType.PHOTO if media_urls else MessageType.TEXT,
                              source=source, message_id=mid, media_urls=media_urls, media_types=media_types,
                              channel_prompt=guidance, timestamp=datetime.datetime.now())
