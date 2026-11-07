@@ -84,3 +84,8 @@ images?, guidance?}`. The server sends `ready {version, features}`, replayed and
 An app that does not announce the `files` feature receives a plain-text note instead of attachments.
 
 MIT licensed.
+
+## More than one agent
+
+Hermes runs one gateway for all your profiles. The app can ask this plugin to make other agents (profiles) live too: it adds a `hermes-app-<profile>` entry to `gateway.profile_routes` in the default profile's `config.yaml` (your other routes and comments are left alone, a backup is kept as `config.yaml.hermes-app.bak`) and restarts Hermes.
+

@@ -46,11 +46,11 @@ logger = logging.getLogger(__name__)
 
 PLATFORM = "hermes_app"
 PLUGIN_NAME = "hermes-app"
-PLUGIN_VERSION = "1.3.1"  # keep in step with plugin.yaml; the app compares it to know when to offer an update
+PLUGIN_VERSION = "1.4.0"  # keep in step with plugin.yaml; the app compares it to know when to offer an update
 DEFAULT_PORT = 8648
 PROTOCOL = 1
 # What this plugin can do, announced to the app on connect so a newer app can tell what an older plugin lacks.
-FEATURES = ["kinds", "activity", "update", "files"]
+FEATURES = ["kinds", "activity", "update", "files", "agents"]
 LOG_KEEP = 5000  # entries kept in the log across restarts
 MAX_FRAME = 24 * 1024 * 1024  # a photo or two, base64 encoded
 MAX_REPLAY = 500
@@ -681,7 +681,8 @@ class HermesAppAdapter(BasePlatformAdapter):
         after = msg.get("after")
         latest = _latest_seq()
         await client.send_json({"t": "ready", "protocol": PROTOCOL, "version": PLUGIN_VERSION, "features": FEATURES,
-                                "latest": latest, "home": self._home_chat()})
+                                "latest": latest, "home": self._home_chat(),
+                                "agents": self._live_agents(), "profiles": _profile_names()})
         if isinstance(after, int) and after < latest:
             for entry in _read_log(after):
                 await client.send_json(entry)
@@ -699,8 +700,28 @@ class HermesAppAdapter(BasePlatformAdapter):
             await self._inbound(client, msg)
         elif kind == "update":
             await self._update_plugin(client)
+        elif kind == "agents":
+            await self._set_agents(client, msg)
         elif kind == "restart":
             await client.send_json({"t": "restarting"})
+            _restart_gateway_soon()
+
+    def _live_agents(self) -> dict:
+        """{profile: chat id} for every agent the app can talk to over this link (read fresh, so it's always current)."""
+        try:
+            return _our_routes(_load_yaml((_home() / "config.yaml").read_text()))
+        except Exception:  # noqa: BLE001
+            return {}
+
+    async def _set_agents(self, client: _Client, msg: dict) -> None:
+        """Fixed action, only for an authenticated app: make exactly these profiles reachable, then restart so
+        Hermes loads the routes. The app sends names only; they are checked against the profiles that exist."""
+        wanted = msg.get("agents")
+        if not isinstance(wanted, list):
+            return
+        result = await asyncio.to_thread(set_agents, [str(w) for w in wanted[:64]])
+        await client.send_json(dict(result, t="agents_result"))
+        if result.get("changed"):
             _restart_gateway_soon()
 
     async def _update_plugin(self, client: _Client) -> None:
@@ -808,6 +829,199 @@ def _restart_gateway_soon(delay: int = 3) -> None:
     cmd = " ".join(shlex.quote(a) for a in _hermes_cmd() + ["gateway", "restart", "-y", "--detach"])
     subprocess.Popen(["sh", "-c", f"sleep {int(delay)}; {cmd}"], start_new_session=True,
                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+# ── more than one agent: Hermes routes each app chat to a profile ────────────
+# One gateway serves every profile. The app gives each agent its own chat id and Hermes's own
+# `gateway.profile_routes` (in the default profile's config.yaml) sends that chat to the profile.
+# We only ever add or remove entries we named ourselves (ROUTE_PREFIX...), by editing the file's text so
+# comments and the user's other routes stay exactly as they were, and we refuse to write unless the
+# result re-parses to the same config plus our routes.
+
+ROUTE_PREFIX = "hermes-app-"
+BACKUP_NAME = "config.yaml.hermes-app.bak"
+_PROFILE_NAME = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
+
+
+def _chat_for_profile(name: str) -> str:
+    return f"agent-{name}"
+
+
+def _profile_names() -> list:
+    """Profiles that exist on this machine (the default one is always served at `home`, so it isn't listed)."""
+    root = _home() / "profiles"
+    try:
+        return sorted(p.name for p in root.iterdir() if p.is_dir() and _PROFILE_NAME.match(p.name))
+    except OSError:
+        return []
+
+
+def _load_yaml(text: str):
+    try:  # Hermes's own reader: its Python may not expose a plain `yaml` module
+        from utils import fast_safe_load as load
+    except ImportError:
+        import yaml
+        load = yaml.safe_load
+    data = load(text)
+    return data if isinstance(data, dict) else {}
+
+
+def _our_routes(config: dict) -> dict:
+    """{profile: chat id} for the hermes_app routes this plugin manages."""
+    gw = config.get("gateway")
+    routes = (gw or {}).get("profile_routes") if isinstance(gw, dict) else None
+    out = {}
+    for r in routes if isinstance(routes, list) else []:
+        if isinstance(r, dict) and r.get("platform") == PLATFORM and str(r.get("name", "")).startswith(ROUTE_PREFIX) \
+                and r.get("profile") and r.get("chat_id"):
+            out[str(r["profile"])] = str(r["chat_id"])
+    return out
+
+
+def _route_block(name: str, indent: str) -> list:
+    return [f"{indent}- name: {ROUTE_PREFIX}{name}", f"{indent}  platform: {PLATFORM}",
+            f"{indent}  chat_id: {_chat_for_profile(name)}", f"{indent}  profile: {name}"]
+
+
+def _indent_of(line: str) -> int:
+    return len(line) - len(line.lstrip(" "))
+
+
+def _edit_routes_text(text: str, wanted: list) -> str:
+    """Return config text whose hermes-app routes are exactly `wanted`; everything else is left byte for byte."""
+    lines = text.split("\n")
+    # 1. drop our existing entries (a "- name: hermes-app-x" item and its indented fields)
+    keep, i = [], 0
+    while i < len(lines):
+        m = re.match(r"^(\s*)-\s+name:\s*['\"]?" + re.escape(ROUTE_PREFIX), lines[i])
+        if m:
+            item = len(m.group(1))
+            i += 1
+            while i < len(lines) and (not lines[i].strip() or _indent_of(lines[i]) > item) and not lines[i].lstrip().startswith("- "):
+                if not lines[i].strip():
+                    break
+                i += 1
+            continue
+        keep.append(lines[i])
+        i += 1
+    lines = keep
+    if not wanted:
+        return "\n".join(lines)
+    # 2. find where to put the new ones
+    for idx, line in enumerate(lines):
+        m = re.match(r"^(\s+)profile_routes:\s*(\[\s*\])?\s*(#.*)?$", line)
+        if m:
+            key_indent = len(m.group(1))
+            item_indent = " " * (key_indent + 2)
+            end = idx + 1
+            last_item = idx
+            while end < len(lines):
+                ln = lines[end]
+                if ln.strip() and not ln.lstrip().startswith("#"):
+                    ind = _indent_of(ln)
+                    if ind < key_indent or (ind == key_indent and not ln.lstrip().startswith("- ")):
+                        break
+                    item_indent = " " * ind if ln.lstrip().startswith("- ") and ind >= key_indent else item_indent
+                    last_item = end
+                end += 1
+            block = [l for n in wanted for l in _route_block(n, item_indent)]
+            if m.group(2):  # `profile_routes: []`
+                lines[idx] = f"{m.group(1)}profile_routes:" + (f" {m.group(3)}" if m.group(3) else "")
+            lines[last_item + 1:last_item + 1] = block
+            return "\n".join(lines)
+    for idx, line in enumerate(lines):
+        if re.match(r"^gateway:\s*(#.*)?$", line):
+            child = next((_indent_of(l) for l in lines[idx + 1:] if l.strip() and not l.lstrip().startswith("#")), 2)
+            ind = " " * (child if child > 0 else 2)
+            block = [f"{ind}profile_routes:"] + [l for n in wanted for l in _route_block(n, ind + "  ")]
+            lines[idx + 1:idx + 1] = block
+            return "\n".join(lines)
+    while lines and not lines[-1].strip():
+        lines.pop()
+    lines += ["gateway:", "  profile_routes:"] + [l for n in wanted for l in _route_block(n, "    ")] + [""]
+    return "\n".join(lines)
+
+
+def _strip_ours(config: dict) -> dict:
+    """The config with our routes taken out, to prove an edit changed nothing else."""
+    import copy
+    c = copy.deepcopy(config)
+    gw = c.get("gateway")
+    if isinstance(gw, dict) and "profile_routes" in gw:
+        if isinstance(gw["profile_routes"], list):
+            gw["profile_routes"] = [r for r in gw["profile_routes"]
+                                    if not (isinstance(r, dict) and str(r.get("name", "")).startswith(ROUTE_PREFIX))]
+        if not gw["profile_routes"]:  # an empty or bare `profile_routes:` means the same as none
+            gw.pop("profile_routes")
+        if not gw:
+            c.pop("gateway")
+    return c
+
+
+def _set_env_line(env_path: pathlib.Path, key: str, value: Optional[str]) -> bool:
+    """Set (or with None, remove) one KEY=value line in a .env file, leaving every other line alone."""
+    try:
+        old = env_path.read_text() if env_path.exists() else ""
+    except OSError:
+        return False
+    lines = [l for l in old.split("\n") if not l.startswith(key + "=")]
+    while lines and not lines[-1].strip():
+        lines.pop()
+    if value is not None:
+        lines.append(f"{key}={value}")
+    new = "\n".join(lines) + "\n" if lines else ""
+    if new == old:
+        return False
+    tmp = env_path.with_name(env_path.name + ".tmp")
+    tmp.write_text(new)
+    with contextlib.suppress(OSError):
+        os.chmod(tmp, 0o600)
+    os.replace(tmp, env_path)
+    return True
+
+
+def set_agents(wanted: list) -> dict:
+    """Make the profiles in `wanted` reachable from the app, and only those. Returns a result for the app.
+    Writes nothing unless the edited file re-parses to the same config plus exactly our routes."""
+    available = _profile_names()
+    names = sorted({str(n) for n in wanted if str(n) in available})
+    skipped = sorted({str(n) for n in wanted} - set(names) - {"default"})
+    path = _home() / "config.yaml"
+    try:
+        text = path.read_text() if path.exists() else ""
+        before = _load_yaml(text)
+    except Exception as exc:  # noqa: BLE001 - reported as text
+        return {"ok": False, "changed": False, "agents": {}, "skipped": skipped,
+                "detail": f"Couldn't read Hermes's settings file: {exc}"}
+    current = _our_routes(before)
+    result = {"ok": True, "changed": False, "agents": {n: _chat_for_profile(n) for n in names}, "skipped": skipped, "detail": ""}
+    if sorted(current) != names or any(current[n] != _chat_for_profile(n) for n in current if n in names):
+        new_text = _edit_routes_text(text, names)
+        try:
+            after = _load_yaml(new_text)
+        except Exception:  # noqa: BLE001
+            after = None
+        if after is None or _our_routes(after) != {n: _chat_for_profile(n) for n in names} or _strip_ours(after) != _strip_ours(before):
+            return dict(result, ok=False, agents=current,
+                        detail="Hermes's settings file has a layout I don't dare edit, so nothing was changed.")
+        try:
+            if path.exists():
+                shutil.copy2(path, path.with_name(BACKUP_NAME))
+            tmp = path.with_name(path.name + ".tmp")
+            tmp.write_text(new_text)
+            with contextlib.suppress(OSError):
+                os.chmod(tmp, path.stat().st_mode & 0o777 if path.exists() else 0o600)
+            os.replace(tmp, path)
+        except OSError as exc:
+            return dict(result, ok=False, agents=current, detail=f"Couldn't save Hermes's settings file: {exc}")
+        result["changed"] = True
+    # scheduled messages from an agent should land in that agent's own chat
+    for n in available:
+        with contextlib.suppress(OSError):
+            if _set_env_line(_home() / "profiles" / n / ".env", "HERMES_APP_HOME_CHANNEL",
+                             _chat_for_profile(n) if n in names else None):
+                result["changed"] = True
+    return result
 
 
 def _port(value) -> int:
