@@ -46,7 +46,7 @@ logger = logging.getLogger(__name__)
 
 PLATFORM = "hermes_app"
 PLUGIN_NAME = "hermes-app"
-PLUGIN_VERSION = "1.5.1"  # keep in step with plugin.yaml; the app compares it to know when to offer an update
+PLUGIN_VERSION = "1.5.2"  # keep in step with plugin.yaml; the app compares it to know when to offer an update
 DEFAULT_PORT = 8648
 PROTOCOL = 1
 # What this plugin can do, announced to the app on connect so a newer app can tell what an older plugin lacks.
@@ -927,7 +927,11 @@ class HermesAppAdapter(BasePlatformAdapter):
 
 # ── plugin registration ──────────────────────────────────────────────────────
 
-_ACTIVE: dict = {"adapter": None}
+# Hermes loads a separate copy of this module for each profile's plugin scope (a turn in one agent's profile runs the
+# copy loaded for that profile), but only the gateway's copy owns the live adapter. So the reference to it lives on
+# `sys`, which every copy in this process shares; a plain module global would be empty in all but one copy and the
+# hooks below would silently do nothing for every other agent.
+_ACTIVE: dict = sys.__dict__.setdefault("_hermes_app_active", {"adapter": None})
 
 
 def _on_pre_tool_call(tool_name: str = "", args=None, **_kw):
@@ -945,6 +949,9 @@ def _stream_hook(event: str):
     def hook(**payload):
         adapter = _ACTIVE.get("adapter")
         if adapter is None:
+            if payload.get("surface") == PLATFORM and not _ACTIVE.get("warned"):
+                _ACTIVE["warned"] = True
+                logger.info("Hermes App: stream hook ran but this process has no live adapter")
             return None
         if payload.get("surface") != PLATFORM:
             with contextlib.suppress(Exception):
